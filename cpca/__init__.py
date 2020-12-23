@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # __init__.py
-
+from collections import defaultdict
 
 from .structures import AddrMap, Pca
 from .structures import P, C, A
@@ -121,6 +121,42 @@ def transform(location_strs, index=None, pos_sensitive=False):
         return result.loc[:, (_PROVINCE, _CITY, _COUNTY, _ADDR, _ADCODE)]
 
 
+def transform_v2(location_strs, index=None, pos_sensitive=False):
+    """将地址描述字符串转换以"省","市","区"信息为列的DataFrame表格
+        Args:
+            locations:地址描述字符集合,可以是list, Series等任意可以进行for in循环的集合
+                      比如:["徐汇区虹漕路461号58号楼5楼", "泉州市洛江区万安塘西工业区"]
+            index:可以通过这个参数指定输出的DataFrame的index,默认情况下是range(len(data))
+            pos_sensitive:如果为True则会多返回三列，分别提取出的省市区在字符串中的位置，如果字符串中不存在的话则显示-1
+        Returns:
+            一个Pandas的DataFrame类型的表格，如下：
+               |省    |市   |区    |地址                 |adcode   |
+               |上海市|市辖区|徐汇区|虹漕路461号58号楼5楼   |310104 |
+               |福建省|泉州市|洛江区|万安塘西工业区        |350504 |
+    """
+    from collections.abc import Iterable
+
+    if not isinstance(location_strs, Iterable):
+        from .exceptions import InputTypeNotSuportException
+        raise InputTypeNotSuportException(
+            'location_strs参数必须为可迭代的类型(比如list, Series等实现了__iter__方法的对象)')
+
+    import pandas as pd
+    results = []
+    for sentence in location_strs:
+        result = pd.DataFrame(
+            _handle_one_record_v2(sentence, pos_sensitive), index=index)
+
+        # 这句的唯一作用是让列的顺序好看一些
+        if pos_sensitive:
+            result = result.loc[:, (_PROVINCE, _CITY, _COUNTY, _ADDR, _ADCODE,
+                _PROVINCE_POS, _CITY_POS, _COUNTY_POS)]
+        else:
+            result = result.loc[:, (_PROVINCE, _CITY, _COUNTY, _ADDR, _ADCODE)]
+        results.append(result)
+    return pd.concat(results)
+
+
 class MatchInfo:
 
     def __init__(self, attr_infos, start_index, end_index) -> None:
@@ -177,6 +213,66 @@ def _handle_one_record(sentence, pos_sensitive) -> dict:
     res[_ADDR] = sentence[truncate_index+1:]
     res[_ADCODE] = adcode
     return res
+
+
+def _handle_one_record_v2(sentence, pos_sensitive) -> dict:
+    """处理一条记录"""
+    # 空记录
+    if not isinstance(sentence, str) or sentence == '' or sentence is None:
+        return empty_record(pos_sensitive)
+
+    set_pos = pos_setter(pos_sensitive)
+
+    # 依次匹配省、市、区
+    matches = defaultdict(set) 
+    for match_info in matcher.iter(sentence):
+        cur_addrs = match_info.get_addrs()
+        cur_addrs = [(addr, match_info.start_index, match_info.end_index)
+                     for addr in cur_addrs]
+        for addr in cur_addrs:
+            for mat in matches[match_info.get_rank()]:
+                if addr[0] == mat[0]: # 去重
+                    addr = (addr[0], max(addr[1], mat[1]), max(addr[2], mat[2]))
+                    matches[match_info.get_rank()].remove(mat)
+                    break
+            matches[match_info.get_rank()].add(addr)
+
+    for rank in range(3):
+        matches[rank] = matches[rank] or [(None, -1, -1)]
+    # 构造所有省、市、区三元组并计算每个元组的分数
+    triplets = [[p, c, a, 0] for p in matches[0] for c in matches[1]
+                for a in matches[2]]
+    max_conf = float('-inf')
+    for i, (p, c, a, conf) in enumerate(triplets):
+        if p[0] and c[0]:
+            triplets[i][3] += 1 if c[0].belong_to(p[0]) else -1
+        if p[0] and a[0]:
+            triplets[i][3] += 1 if a[0].belong_to(p[0]) else -1
+        if c[0] and a[0]:
+            triplets[i][3] += 1 if a[0].belong_to(c[0]) else -1
+        max_conf = max(max_conf, triplets[i][3])
+
+    # 保留分数最高的三元组并构造返回结果
+    rets = []
+    for triplet in triplets:
+        p, c, a, conf = triplet
+        if conf  == max_conf:
+            adcode = ((a[0] or c[0] or p[0]).adcode
+                      if a[0] or c[0] or p[0] else None)
+            if not adcode:
+                continue
+            res = empty_record(pos_sensitive)
+            truncate_idx = -1
+            for rank in range(3):
+                if triplet[rank][0]:
+                    set_pos(res, rank, triplet[rank][1])
+                    truncate_idx = max(truncate_idx, triplet[rank][2])
+            update_res_by_adcode(res, adcode)
+            res[_ADDR] = sentence[truncate_idx + 1:]
+            res[_ADCODE] = adcode
+            rets.append(res)
+
+    return rets if rets else [empty_record(pos_sensitive)]
 
 
 def _fill_adcode(adcode):

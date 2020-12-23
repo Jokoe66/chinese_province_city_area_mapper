@@ -19,7 +19,9 @@ class MatchInfo:
     def get_one_addr(self):
         return self.attr_infos[0]
 
-
+    def get_addrs(self):
+        return self.attr_infos
+    
 class Matcher:
 
     # 特殊的简写,主要是几个少数民族自治区
